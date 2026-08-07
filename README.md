@@ -89,7 +89,16 @@ resolution is probed with `v4l2-ctl --list-formats-ext` and matched against
 belaUI's live pipeline list (from its `pipelines` websocket message) by
 source-type keyword (`_usb_` vs `_hdmi_` in the pipeline name, e.g.
 `rk3588/h265_usb_mjpeg_1080p30` / `rk3588/h265_hdmi_1080p30`) and closest
-resolution. Note: belaUI's `pipeline` field in the `start` command is
+resolution. The probe scans **every** resolution the device reports across
+**every** pixel format it offers and picks the largest by area (ties broken
+by higher fps) - not just the first one `v4l2-ctl` happens to print. That
+matters because most UVC webcams list uncompressed YUYV before compressed
+MJPG, and YUYV frequently can't sustain full frame rate at high resolution
+over USB2 - so a real 1080p webcam's first-listed mode is often a 480p YUYV
+fallback, with the actual 1080p MJPG mode listed later. Taking "the first
+line" instead of "the largest" used to match a 1080p-capable webcam to the
+720p preset, since 480 rounds closer to 720 than 1080 with no lower preset
+available. Note: belaUI's `pipeline` field in the `start` command is
 actually the **sha1 hash of the pipeline's name** (e.g.
 `sha1("rk3588/h265_usb_mjpeg_1080p30")`), not the readable string - the
 daemon looks this up from the cached pipeline list itself, so you never need

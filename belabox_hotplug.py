@@ -440,11 +440,24 @@ async def poll_hdmi(hdmi_device: str, poll_interval: float, event_queue: asyncio
 # ---------------------------------------------------------------------------
 
 def probe_source_resolution(device_node: str):
-    """Runs `v4l2-ctl --list-formats-ext` on the given node and returns the
-    (width, height, fps) of its first listed format. On this hardware both
-    the USB card and the HDMI-in report their best/current format first
-    (USB: highest native resolution; HDMI: the live-negotiated signal
-    format), so this doesn't need special-casing per source type."""
+    """Runs `v4l2-ctl --list-formats-ext` and returns the (width, height,
+    fps) of the HIGHEST-resolution format/size this source actually offers -
+    picked by scanning every 'Size: Discrete' entry across every pixel
+    format and taking the largest by area, not just the first one in the
+    output.
+
+    Taking "the first listed" instead of "the largest" was the original
+    approach here, on the assumption that a device's best format is always
+    listed first. That holds for this board's own HDMI-in (only one format
+    is ever live at a time) but does NOT hold for most UVC webcams: they
+    commonly list uncompressed YUYV before compressed MJPG, and YUYV can't
+    sustain full frame rate at high resolution over USB2 - so a real 1080p
+    webcam's very first 'Size: Discrete' line in the output is often YUYV's
+    640x480, with the actual 1920x1080 MJPG mode listed much further down.
+    Verified against this exact shape of output: taking "first match" here
+    matched a 1080p-capable webcam to belacoder's 720p preset, since 480 is
+    closer to 720 than to 1080 with no lower preset available - fixed by
+    scanning all entries instead of stopping at the first."""
     try:
         result = subprocess.run(
             ["v4l2-ctl", "-d", device_node, "--list-formats-ext"],
@@ -454,14 +467,31 @@ def probe_source_resolution(device_node: str):
         log.warning(f"Failed to probe formats on {device_node}: {e}")
         return None, None, None
 
-    size_match = re.search(r"Size:\s*Discrete\s*(\d+)x(\d+)", result.stdout)
-    if not size_match:
+    # Split on each 'Size:' line so every entry's own Interval/fps lines can
+    # be scanned without bleeding into the next size's or the next pixel
+    # format's entries.
+    size_starts = list(re.finditer(r"Size:\s*Discrete\s*(\d+)x(\d+)", result.stdout))
+    if not size_starts:
         return None, None, None
-    width, height = int(size_match.group(1)), int(size_match.group(2))
 
-    fps_match = re.search(r"Discrete\s*[\d.]+s\s*\(([\d.]+)\s*fps\)", result.stdout)
-    fps = float(fps_match.group(1)) if fps_match else None
+    best = None  # (area, width, height, fps)
+    for i, m in enumerate(size_starts):
+        width, height = int(m.group(1)), int(m.group(2))
+        block_end = size_starts[i + 1].start() if i + 1 < len(size_starts) else len(result.stdout)
+        block = result.stdout[m.end():block_end]
+        fps_matches = [float(f) for f in re.findall(r"Discrete\s*[\d.]+s\s*\(([\d.]+)\s*fps\)", block)]
+        fps = max(fps_matches) if fps_matches else None
 
+        # Largest area wins; on a tie (the same resolution offered by more
+        # than one pixel format, e.g. both YUYV and MJPG list 1920x1080 but
+        # at very different achievable fps), prefer the higher fps rather
+        # than keeping whichever format happened to be listed first.
+        area = width * height
+        rank = (area, fps if fps is not None else -1)
+        if best is None or rank > (best[0], best[3] if best[3] is not None else -1):
+            best = (area, width, height, fps)
+
+    _, width, height, fps = best
     return width, height, fps
 
 
