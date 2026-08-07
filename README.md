@@ -91,14 +91,31 @@ source-type keyword (`_usb_` vs `_hdmi_` in the pipeline name, e.g.
 `rk3588/h265_usb_mjpeg_1080p30` / `rk3588/h265_hdmi_1080p30`) and closest
 resolution. The probe scans **every** resolution the device reports across
 **every** pixel format it offers and picks the largest by area (ties broken
-by higher fps) - not just the first one `v4l2-ctl` happens to print. That
-matters because most UVC webcams list uncompressed YUYV before compressed
-MJPG, and YUYV frequently can't sustain full frame rate at high resolution
-over USB2 - so a real 1080p webcam's first-listed mode is often a 480p YUYV
-fallback, with the actual 1080p MJPG mode listed later. Taking "the first
-line" instead of "the largest" used to match a 1080p-capable webcam to the
-720p preset, since 480 rounds closer to 720 than 1080 with no lower preset
-available. Note: belaUI's `pipeline` field in the `start` command is
+by higher fps) - not just the first one `v4l2-ctl` happens to print, and not
+just the literal largest number either. Two real-world UVC quirks both had
+to be handled:
+
+- Most webcams list uncompressed YUYV before compressed MJPG, and YUYV
+  frequently can't sustain full frame rate at high resolution over USB2 -
+  so a real 1080p webcam's first-listed mode is often a 480p YUYV fallback,
+  with the actual 1080p MJPG mode listed later. Taking "the first line"
+  instead of "the largest" used to match a 1080p-capable webcam to the 720p
+  preset, since 480 rounds closer to 720 than 1080 with no lower preset
+  available.
+- Many UVC webcams - especially higher-megapixel ones - *also* enumerate
+  still-photo snapshot sizes in that same format list, e.g. a 2592x1944
+  entry offered at only ~5fps alongside a proper 1920x1080@30 video mode.
+  Taking "the largest resolution, full stop" picks the photo size, and its
+  unrelated low fps then gets compared against belacoder's presets instead
+  of the real video mode's - which is worse than the first bug, since the
+  resulting match can correspond to a mode the source can't actually
+  stream at all. Sizes offering less than 15fps are now excluded from
+  "best" consideration first (a photo mode is physically incapable of real
+  video frame rates, regardless of the numbers involved), falling back to
+  every size only if none clear that floor, so a source that's genuinely
+  slow everywhere still returns its best rather than nothing.
+
+Note: belaUI's `pipeline` field in the `start` command is
 actually the **sha1 hash of the pipeline's name** (e.g.
 `sha1("rk3588/h265_usb_mjpeg_1080p30")`), not the readable string - the
 daemon looks this up from the cached pipeline list itself, so you never need

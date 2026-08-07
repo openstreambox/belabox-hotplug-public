@@ -439,12 +439,17 @@ async def poll_hdmi(hdmi_device: str, poll_interval: float, event_queue: asyncio
 # Format probing + pipeline matching
 # ---------------------------------------------------------------------------
 
+
+# Below this, a mode is treated as a non-video "snapshot" size rather than
+# something to stream from - see probe_source_resolution().
+_MIN_VIDEO_FPS = 15.0
+
+
 def probe_source_resolution(device_node: str):
     """Runs `v4l2-ctl --list-formats-ext` and returns the (width, height,
-    fps) of the HIGHEST-resolution format/size this source actually offers -
-    picked by scanning every 'Size: Discrete' entry across every pixel
-    format and taking the largest by area, not just the first one in the
-    output.
+    fps) of the best VIDEO mode this source actually offers - picked by
+    scanning every 'Size: Discrete' entry across every pixel format and
+    taking the largest by area, not just the first one in the output.
 
     Taking "the first listed" instead of "the largest" was the original
     approach here, on the assumption that a device's best format is always
@@ -454,10 +459,22 @@ def probe_source_resolution(device_node: str):
     sustain full frame rate at high resolution over USB2 - so a real 1080p
     webcam's very first 'Size: Discrete' line in the output is often YUYV's
     640x480, with the actual 1920x1080 MJPG mode listed much further down.
-    Verified against this exact shape of output: taking "first match" here
-    matched a 1080p-capable webcam to belacoder's 720p preset, since 480 is
-    closer to 720 than to 1080 with no lower preset available - fixed by
-    scanning all entries instead of stopping at the first."""
+
+    "Largest by area" alone isn't enough either, and shipped broken once
+    already: many UVC webcams - especially higher-megapixel ones - also
+    enumerate still-photo SNAPSHOT sizes in the very same MJPG format list,
+    e.g. a 2592x1944 entry offered at only ~5fps alongside a proper
+    1920x1080@30 video mode. Ranking purely by area picks the photo size,
+    and its low fps then gets compared against belacoder's presets instead
+    of the real video mode's, producing exactly the wrong-preset symptom
+    this was meant to fix (worse, even: a resolution nothing can actually
+    stream at). So sizes below _MIN_VIDEO_FPS are excluded from "best"
+    consideration first - a photo mode is physically incapable of the frame
+    rates real video streaming needs, so this is a reliable way to tell the
+    two apart regardless of the numbers involved. Falls back to considering
+    every size if literally none clear that floor, so a source that's
+    genuinely slow everywhere (an old capture bridge, say) doesn't come back
+    empty just because nothing on it qualifies as "fast"."""
     try:
         result = subprocess.run(
             ["v4l2-ctl", "-d", device_node, "--list-formats-ext"],
@@ -474,19 +491,24 @@ def probe_source_resolution(device_node: str):
     if not size_starts:
         return None, None, None
 
-    best = None  # (area, width, height, fps)
+    entries = []  # [(area, width, height, fps), ...]
     for i, m in enumerate(size_starts):
         width, height = int(m.group(1)), int(m.group(2))
         block_end = size_starts[i + 1].start() if i + 1 < len(size_starts) else len(result.stdout)
         block = result.stdout[m.end():block_end]
         fps_matches = [float(f) for f in re.findall(r"Discrete\s*[\d.]+s\s*\(([\d.]+)\s*fps\)", block)]
         fps = max(fps_matches) if fps_matches else None
+        entries.append((width * height, width, height, fps))
 
+    video_entries = [e for e in entries if e[3] is not None and e[3] >= _MIN_VIDEO_FPS]
+    candidates = video_entries or entries
+
+    best = None  # (area, width, height, fps)
+    for area, width, height, fps in candidates:
         # Largest area wins; on a tie (the same resolution offered by more
         # than one pixel format, e.g. both YUYV and MJPG list 1920x1080 but
         # at very different achievable fps), prefer the higher fps rather
         # than keeping whichever format happened to be listed first.
-        area = width * height
         rank = (area, fps if fps is not None else -1)
         if best is None or rank > (best[0], best[3] if best[3] is not None else -1):
             best = (area, width, height, fps)
