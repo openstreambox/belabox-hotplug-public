@@ -22,6 +22,16 @@ import os
 CONFIG_DIR = "/etc/belabox-hotplug"
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
+# belaUI tries these ports in this order at startup and falls back down the
+# list if one is already taken (see its own httpListenPorts in belaUI.js).
+# ws:// with no port defaults to 80, which silently hangs forever - with no
+# error and no output - if belaUI actually landed on 8080 or 81 instead.
+# Trying the same order here means this script finds belaUI wherever it
+# actually ended up, rather than assuming port 80.
+CANDIDATE_PORTS = [80, 8080, 81]
+CONNECT_TIMEOUT = 8.0    # per-port TCP connect timeout
+AUTH_TIMEOUT = 10.0      # time to wait for belaUI's auth response once connected
+
 try:
     import websockets
 except ImportError:
@@ -30,22 +40,52 @@ except ImportError:
     sys.exit(1)
 
 
-async def get_token(password: str) -> str:
-    uri = "ws://127.0.0.1"
-    async with websockets.connect(uri) as ws:
+async def _try_port(port: int, password: str):
+    """Attempts the full connect+auth handshake on one port. Returns the auth
+    token, or raises on failure/timeout - never hangs indefinitely, since
+    that's exactly the failure mode this replaces."""
+    uri = f"ws://127.0.0.1:{port}"
+    print(f"Trying {uri} ...")
+    async with websockets.connect(uri, open_timeout=CONNECT_TIMEOUT) as ws:
         await ws.send(json.dumps({"auth": {"password": password, "persistent_token": True}}))
 
         # Wait for the auth response specifically; belaUI may send other
         # messages (config, pipelines, status) around the same time.
-        while True:
-            raw = await ws.recv()
-            msg = json.loads(raw)
-            if "auth" in msg:
-                auth = msg["auth"]
-                if auth.get("success") is True and auth.get("auth_token"):
-                    return auth["auth_token"]
-                else:
-                    raise RuntimeError(f"Authentication failed: {auth}")
+        async def wait_for_auth():
+            while True:
+                raw = await ws.recv()
+                msg = json.loads(raw)
+                if "auth" in msg:
+                    return msg["auth"]
+
+        auth = await asyncio.wait_for(wait_for_auth(), timeout=AUTH_TIMEOUT)
+        if auth.get("success") is True and auth.get("auth_token"):
+            print(f"Connected on port {port}")
+            return auth["auth_token"], port
+        raise RuntimeError(f"Authentication failed: {auth}")
+
+
+async def get_token(password: str) -> str:
+    errors = []
+    for port in CANDIDATE_PORTS:
+        try:
+            token, port = await _try_port(port, password)
+            return token, port
+        except RuntimeError:
+            raise  # wrong password - belaUI DID respond, no point trying other ports
+        except (OSError, asyncio.TimeoutError) as e:
+            errors.append(f"port {port}: {e}")
+            continue
+
+    raise RuntimeError(
+        "Could not reach belaUI on any of ports "
+        f"{CANDIDATE_PORTS} within {CONNECT_TIMEOUT:.0f}s each.\n"
+        + "\n".join(f"  {e}" for e in errors) +
+        "\n\nCheck belaUI is actually running and see which port it bound to:\n"
+        "  systemctl list-units | grep -i bela\n"
+        "  sudo journalctl -u <that unit name> | grep -i listen\n"
+        "  sudo ss -tlnp | grep -E ':80|:8080|:81'"
+    )
 
 
 def main():
@@ -55,7 +95,11 @@ def main():
 
     password = sys.argv[1]
 
-    token = asyncio.run(get_token(password))
+    try:
+        token, port = asyncio.run(get_token(password))
+    except RuntimeError as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
     print(f"Got auth token: {token}")
 
     os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -66,7 +110,9 @@ def main():
             config = json.load(f)
 
     config["auth_token"] = token
-    config.setdefault("belaui_ws_url", "ws://127.0.0.1")
+    # Record whichever port actually worked, so belabox_hotplug.py connects
+    # to the same place without repeating this port hunt on every restart.
+    config["belaui_ws_url"] = f"ws://127.0.0.1:{port}"
     config.setdefault("hdmi_device", None)  # None = autodetect the rk_hdmirx node
     config.setdefault("hdmi_poll_interval_seconds", 1.0)
     config.setdefault("settle_delay_seconds", 2.0)

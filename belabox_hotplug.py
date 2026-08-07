@@ -125,7 +125,13 @@ class BelaUIClient:
         messages, reconnecting automatically if the connection drops."""
         while True:
             try:
-                async with websockets.connect(self.ws_url) as ws:
+                # open_timeout bounds the TCP connect + WS handshake. Without
+                # it, a connection that's silently dropped (nothing listening
+                # on that port, a firewall eating the SYN) hangs forever
+                # rather than raising - reproduced in the field via
+                # bootstrap_token.py's equivalent unbounded connect, which is
+                # what prompted adding this here too.
+                async with websockets.connect(self.ws_url, open_timeout=10) as ws:
                     self.ws = ws
                     self.authenticated.clear()
                     await ws.send(json.dumps({"auth": {"token": self.auth_token}}))
@@ -134,7 +140,8 @@ class BelaUIClient:
                     async for raw in ws:
                         await self._handle_message(json.loads(raw))
 
-            except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
+            except (websockets.ConnectionClosed, ConnectionRefusedError, OSError,
+                    asyncio.TimeoutError, TimeoutError) as e:
                 log.warning(f"belaUI connection lost/unavailable ({e}), retrying in 5s...")
                 self.ws = None
                 self.authenticated.clear()
