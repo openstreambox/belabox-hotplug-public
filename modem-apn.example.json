@@ -1,0 +1,124 @@
+{
+  "_readme": [
+    "Copy this to /etc/belabox-hotplug/modem-apn.json and edit it for your SIMs.",
+    "Keys starting with an underscore are ignored by the loader (JSON has no comments).",
+    "",
+    "RESOLUTION ORDER (match_order below):  iccid -> imsi_plmn -> carrier -> default",
+    "",
+    "Your own per-ICCID entries deliberately outrank the shipped carrier table.",
+    "The table is keyed on the HOST network's PLMN, but an MVNO SIM broadcasts the",
+    "host's PLMN while needing a different APN - a Tello SIM reports 310260",
+    "(T-Mobile) yet needs 'wholesale', not 'fast.t-mobile.com'. If the table were",
+    "consulted first, every MVNO would match its host carrier's row and the",
+    "per-ICCID override would never be reached for exactly the SIMs it exists for.",
+    "",
+    "Matching always uses the SIM's HOME PLMN (ModemManager's SIM operator-code, or",
+    "the IMSI split using the MNC length from the SIM's EF_AD), never the network",
+    "the modem is currently registered on - a roaming SIM would otherwise match",
+    "whichever local carrier it happened to camp on.",
+    "",
+    "Find your SIM's ICCID / IMSI / home PLMN with:  python3 modem-apn-fix.py --list"
+  ],
+
+  "_readme_carriers": [
+    "!!! THIS TABLE GOES STALE. Carrier APNs change, networks get retired and MVNOs",
+    "get acquired. It is a good starting point, NOT a permanently authoritative",
+    "source. Spot-check it against each carrier's own current documentation",
+    "periodically, and re-check any entry the moment a SIM won't attach.",
+    "Bump _apn_table_reviewed when you do; the script warns once it is over a year old.",
+    "",
+    "Entries WITHOUT mcc_mnc_prefixes cannot be matched automatically - MVNOs ride",
+    "their host carrier's PLMN, so there is nothing unique to match on. They are",
+    "reference data: point an ICCID prefix at one to use it, e.g.",
+    "  \"apn_by_iccid_prefix\": { \"8901360\": { \"carrier\": \"Cricket Wireless (AT&T MVNO)\" } }",
+    "",
+    "apn_variant_order picks which field of a matched entry is used. 'apn_5g' is",
+    "deliberately NOT in the default order: an EM7455 is LTE-only Cat-6 hardware.",
+    "Note for standalone modems: AT&T documents 'Broadband' (apn_hotspot) for",
+    "tablets/hotspots/modem devices rather than NXTGENPHONE. A BELABOX modem is",
+    "arguably one of those, but it depends on the plan the SIM is on - so the",
+    "default order still prefers 'apn'. Override per-SIM with",
+    "  { \"carrier\": \"AT&T\", \"variant\": \"apn_hotspot\" }",
+    "or globally by reordering apn_variant_order."
+  ],
+
+  "_apn_table_reviewed": "2026-07",
+
+  "carriers": {
+    "AT&T": {
+      "mcc_mnc_prefixes": ["310410", "310380", "310170", "310560", "310980"],
+      "apn": "NXTGENPHONE",
+      "apn_5g": "ENHANCEDPHONE",
+      "apn_hotspot": "Broadband",
+      "notes": "Use NXTGENPHONE for LTE devices, ENHANCEDPHONE for 5G-capable devices, Broadband for tablets/standalone hotspot/modem devices specifically."
+    },
+    "T-Mobile": {
+      "mcc_mnc_prefixes": ["310260", "310200", "310210", "310160", "310250", "310660", "311882"],
+      "apn": "fast.t-mobile.com",
+      "apn_hotspot": "pcweb.tmobile.com",
+      "notes": "Same APN for LTE and 5G, data and MMS. Sprint's network was fully retired June 30, 2022 - all former Sprint IMSIs now route through T-Mobile and use this APN. UScellular was acquired by T-Mobile (completed Aug 1, 2025) and migrated lines also use this APN."
+    },
+    "Verizon": {
+      "mcc_mnc_prefixes": ["311480", "310010", "311270", "311271", "311272", "311390"],
+      "apn": "vzwinternet",
+      "notes": "Single APN covers 4G, 5G, and MMS. Verizon SIMs also auto-provision background APNs (vzwims, vzwadmin) - do not touch or duplicate these, only vzwinternet needs explicit configuration if not auto-populated. Verizon retired 3G CDMA entirely on Dec 31, 2022."
+    },
+    "Cricket Wireless (AT&T MVNO)": {
+      "apn": "ndo",
+      "apn_alt": "endo",
+      "notes": "Newer Cricket SIMs may require 'endo' instead of 'ndo' - check both if one fails. No mcc_mnc_prefixes: Cricket rides AT&T's PLMNs, so it can only be selected via an explicit ICCID entry."
+    },
+    "Consumer Cellular": {
+      "apn_att_network": "ccdata",
+      "apn_att_alt": "att.mvno",
+      "apn_tmobile_network": "fast.t-mobile.com",
+      "notes": "Dual-network MVNO - underlying network (AT&T vs T-Mobile) must be determined per-SIM, values are not interchangeable. Field names here are non-standard on purpose so nothing is picked automatically; select one with an explicit ICCID entry, e.g. {\"carrier\": \"Consumer Cellular\", \"variant\": \"apn_att_network\"}."
+    },
+    "Boost Mobile (independent, EchoStar/DISH-owned)": {
+      "apn": "boost.data",
+      "apn_legacy_sprint": "Boost_Mobile",
+      "notes": "Boost is now its own network (no longer Sprint-based) as of the DISH divestiture; boost.data is current, Boost_Mobile is legacy fallback only."
+    }
+  },
+
+  "_readme_maps": [
+    "apn_by_iccid_prefix: keys are ICCID prefixes - use as many digits as you need.",
+    "A short prefix covers a whole carrier's SIM batch; a full 19-20 digit ICCID pins",
+    "one specific SIM and, being longer, overrides the short one.",
+    "apn_by_imsi_plmn: keys are the home PLMN (MCC+MNC). Use this to override a row",
+    "in the carrier table without editing the table itself.",
+    "Values in either map may be:",
+    "  \"america.bics\"                                     - a bare APN",
+    "  { \"apn\": \"wholesale\", \"label\": \"Tello\" }            - explicit",
+    "  { \"carrier\": \"AT&T\", \"variant\": \"apn_hotspot\" }     - reuse the table"
+  ],
+
+  "apn_by_iccid_prefix": {
+    "8901240": { "apn": "wholesale", "label": "Tello (T-Mobile US MVNO)" },
+    "8934300": { "apn": "america.bics", "label": "eiot / BICS" }
+  },
+
+  "apn_by_imsi_plmn": {},
+
+  "default_apn": null,
+
+  "match_order": ["iccid", "imsi_plmn", "carrier", "default"],
+  "apn_variant_order": ["apn", "apn_alt", "apn_hotspot"],
+
+  "pdp_type": "IP",
+  "cgdcont_profile": 1,
+  "enforce_pdp_type": true,
+  "entercnd_password": "A710",
+
+  "at_method": "auto",
+  "port_release": "inhibit",
+  "modemmanager_restore_log_level": "INFO",
+
+  "at_timeout_seconds": 20.0,
+  "settle_seconds": 5.0,
+  "verify_timeout_seconds": 90.0,
+  "verify_poll_seconds": 5.0,
+
+  "usb_vendor_ids": ["1199", "413c", "03f0"],
+  "allow_non_sierra": false
+}

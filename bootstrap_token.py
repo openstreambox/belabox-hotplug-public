@@ -70,7 +70,20 @@ def main():
     config.setdefault("hdmi_device", None)  # None = autodetect the rk_hdmirx node
     config.setdefault("hdmi_poll_interval_seconds", 1.0)
     config.setdefault("settle_delay_seconds", 2.0)
-    config.setdefault("source_priority", "hdmi")  # "hdmi" or "usb", see README
+    # Ordered highest-priority-first. "network" is a phone (or anything else)
+    # streaming into the box over WiFi via belaUI's own RTMP/SRT ingest.
+    # The old string form ("hdmi"/"usb") is still honoured if already present.
+    config.setdefault("source_priority", ["network", "hdmi", "usb"])
+    config.setdefault("network_fps", 30.0)  # picks among the *_25/30/50/60fps presets
+    config.setdefault("keepalive_interval_seconds", 5.0)
+    # Sierra Wireless modem internal-APN repair (modem-apn-fix.py). Inert
+    # unless that script AND /etc/belabox-hotplug/modem-apn.json both exist,
+    # so leaving these at their defaults costs nothing on a modem-less rig.
+    config.setdefault("modem_apn_fix_enabled", True)
+    config.setdefault("modem_apn_fix_on_start", True)
+    config.setdefault("modem_apn_config_path", "/etc/belabox-hotplug/modem-apn.json")
+    config.setdefault("modem_settle_delay_seconds", 25.0)
+    config.setdefault("modem_fix_timeout_seconds", 300.0)
 
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
