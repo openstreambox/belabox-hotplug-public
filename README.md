@@ -563,15 +563,44 @@ prefix at one to use it:
 }
 ```
 
-**Which APN field gets used** comes from `apn_variant_order`, default
-`["apn", "apn_alt", "apn_hotspot"]`. `apn_5g` is deliberately not in that
-list: an EM7455 is LTE-only Cat-6 hardware. Worth knowing for AT&T: their
-own guidance is `Broadband` (`apn_hotspot`) for tablets, hotspots and
-standalone modem devices rather than `NXTGENPHONE`. A BELABOX modem is
-arguably one of those, but it depends on the plan the SIM is on, so the
-default still prefers `apn` - override per-SIM with
-`{"carrier": "AT&T", "variant": "apn_hotspot"}` if `NXTGENPHONE` doesn't
-attach.
+**Which APN field gets used is decided per modem, from what the hardware can
+actually do:**
+
+| Modem reports | Order used | Default |
+|---|---|---|
+| LTE only | `apn_variant_order` | `["apn", "apn_alt", "apn_hotspot"]` |
+| 5GNR capable | `apn_variant_order_5g` | `["apn_5g", "apn", "apn_alt", "apn_hotspot"]` |
+
+This matters because handing AT&T's `ENHANCEDPHONE` to an EM7455 - LTE-only
+Cat-6 silicon that will never see a 5G cell - would be writing a knowingly
+wrong attach APN, which is the failure this whole script exists to repair.
+So the same AT&T SIM resolves differently depending on which modem it's in:
+
+```
+EM7455 (LTE-only)        -> NXTGENPHONE     [AT&T (apn)]
+EM9191 (5GNR capable)    -> ENHANCEDPHONE   [AT&T (apn_5g)]
+5G modem, LTE-locked     -> NXTGENPHONE     [AT&T (apn)]
+```
+
+Detection keys on ModemManager's **current** capabilities and access
+technologies, not supported ones - a modem that supports 5GNR but is
+configured LTE-only will make its initial attach over LTE, so the LTE APN is
+what belongs in profile 1. That third line above is exactly that case, and
+it's logged rather than silently treated as LTE-only hardware. Set
+`assume_5g` to `true`/`false` to override; `null` (default) autodetects.
+`--list` shows each modem's capabilities and which order it will use.
+
+Where a carrier uses one APN for both (T-Mobile, Verizon), `apn_5g` is set
+to the same value on purpose rather than omitted - it records that it was
+checked. Deleting it is harmless; the order falls through to `apn`.
+
+Worth knowing for AT&T: their own guidance is `Broadband` (`apn_hotspot`)
+for tablets, hotspots and standalone modem devices rather than
+`NXTGENPHONE`. A BELABOX modem is arguably one of those, but it depends on
+the plan the SIM is on, so the default still prefers `apn` - override
+per-SIM with `{"carrier": "AT&T", "variant": "apn_hotspot"}` if
+`NXTGENPHONE` doesn't attach. An explicit `variant` always wins over the
+capability-based choice.
 
 Map values may be a bare APN string, an object with `apn`/`label`/
 `pdp_type`, or a `{"carrier": ..., "variant": ...}` reference into the

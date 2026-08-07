@@ -161,11 +161,21 @@ DEFAULT_CONFIG = {
     # while needing a completely different APN. See resolve_expected_apn().
     "match_order": ["iccid", "imsi_plmn", "carrier", "default"],
 
-    # Which field of a carrier entry to use, first present wins. "apn_5g" is
-    # deliberately absent: an EM7455 is LTE-only Cat-6 hardware and a 5G APN
-    # on it is at best pointless. Add it here if you're running 5G-capable
-    # modems (EM9191 etc.).
+    # Which field of a carrier entry to use, first present wins.
+    #
+    # Two orders, picked per modem by what the hardware can actually do:
+    # handing AT&T's ENHANCEDPHONE to an EM7455 - LTE-only Cat-6 silicon that
+    # will never see a 5G cell - would be writing a knowingly wrong attach
+    # APN, which is the failure this whole script exists to repair. So the 5G
+    # variants are present and used, but only on modems that report 5GNR.
+    # See modem_prefers_5g().
     "apn_variant_order": ["apn", "apn_alt", "apn_hotspot"],
+    "apn_variant_order_5g": ["apn_5g", "apn", "apn_alt", "apn_hotspot"],
+
+    # null = decide per modem from ModemManager's reported capabilities.
+    # true/false forces it either way, for a modem MM misreports or to pin
+    # behaviour during testing.
+    "assume_5g": None,
 
     # Informational: when the carrier table above was last verified.
     "_apn_table_reviewed": None,
@@ -264,6 +274,16 @@ def _clean(value):
     if value in (None, "", "--"):
         return None
     return value
+
+
+def _as_list(value):
+    """Normalizes mmcli's list-or-string-or-missing fields to a list of
+    non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    return [str(v).strip() for v in value if _clean(v)]
 
 
 def _dig(obj, *keys):
@@ -655,6 +675,12 @@ class Modem:
         self.mm_state = None
         self.mm_reg_state = None
         self.vendor_id = None
+        # ModemManager's capability strings, e.g. "gsm-umts, lte" or
+        # "gsm-umts, lte, 5gnr". Used to decide whether a 5G APN variant is
+        # appropriate for this hardware - see modem_prefers_5g().
+        self.current_capabilities = []
+        self.supported_capabilities = []
+        self.access_technologies = []
 
     @property
     def label(self) -> str:
@@ -674,6 +700,26 @@ class Modem:
     def is_sierra(self) -> bool:
         blob = " ".join(filter(None, [self.manufacturer, self.model, self.revision]))
         return bool(_SIERRA_HINT_RE.search(blob))
+
+    @property
+    def has_5g(self) -> bool:
+        """True if this modem can currently attach over 5G NR.
+
+        Keyed on *current* capabilities and access technologies rather than
+        *supported* ones: a modem that supports 5GNR but is presently
+        configured LTE-only will make its initial attach over LTE, so the LTE
+        APN is the one that must be in profile 1. `supported_capabilities` is
+        still logged, so a modem that could do 5G but isn't set up for it is
+        visible rather than silently treated as LTE-only hardware.
+
+        '5gnr' is ModemManager's own token; matching on a bare '5g' would
+        false-positive on model strings."""
+        blob = " ".join(self.current_capabilities + self.access_technologies).lower()
+        return "5gnr" in blob
+
+    @property
+    def could_do_5g(self) -> bool:
+        return "5gnr" in " ".join(self.supported_capabilities).lower()
 
 
 _PORT_RE = re.compile(r"^(\S+)\s+\((\w+)\)$")
@@ -766,6 +812,13 @@ def _describe_modem(index: int, cfg: dict):
     ports = _dig(data, "modem", "generic", "ports") or []
     m.at_ports, m.qmi_port = _parse_ports(ports)
     m.vendor_id = _read_sysfs_vendor(m.sysfs)
+
+    # mmcli reports these as a list, but the entries are themselves
+    # comma-joined ("gsm-umts, lte, 5gnr"), and older releases use a bare
+    # string. _as_list() flattens all of that to a plain list of strings.
+    m.current_capabilities = _as_list(_dig(data, "modem", "generic", "current-capabilities"))
+    m.supported_capabilities = _as_list(_dig(data, "modem", "generic", "supported-capabilities"))
+    m.access_technologies = _as_list(_dig(data, "modem", "generic", "access-technologies"))
 
     # Sierra rebrands: trust the USB vendor ID as well as the model string.
     if not m.is_sierra and m.vendor_id in [v.lower() for v in cfg["usb_vendor_ids"]]:
@@ -909,26 +962,50 @@ def load_sim_details_via_at(m: Modem, transport):
 # SIM -> APN resolution
 # ---------------------------------------------------------------------------
 
-def _carrier_variant(carrier_entry: dict, cfg: dict, want=None):
+def modem_prefers_5g(cfg: dict, m) -> bool:
+    """Whether this modem should get a carrier's 5G APN variant.
+
+    `assume_5g` in the config overrides; otherwise it's decided from what
+    ModemManager says the modem can currently do. An explicit override is
+    logged, because "why did it pick ENHANCEDPHONE" is exactly the kind of
+    question this script has to be able to answer from a journal."""
+    forced = cfg.get("assume_5g")
+    if forced is not None:
+        log.info(f"assume_5g={forced} in config; overriding capability detection")
+        return bool(forced)
+    if m is None:
+        return False
+    if m.has_5g:
+        return True
+    if m.could_do_5g:
+        log.info(f"Modem reports 5GNR support but is not currently configured for it "
+                 f"(current: {', '.join(m.current_capabilities) or 'unknown'}); "
+                 f"using the LTE APN, since that's what it will attach with")
+    return False
+
+
+def _carrier_variant(carrier_entry: dict, cfg: dict, want=None, prefer_5g=False):
     """Picks which APN field of a carrier table entry to use.
 
     Carrier entries carry several: `apn` (the normal one), `apn_5g`,
     `apn_hotspot` (AT&T's "Broadband" for tablets and standalone modems),
     `apn_alt` (Cricket's ndo/endo pair). `want` names one explicitly;
-    otherwise the first field present in apn_variant_order wins.
+    otherwise the first field present in the applicable variant order wins -
+    apn_variant_order_5g on 5G-capable hardware, apn_variant_order otherwise.
 
     Returns (apn, variant_name) or (None, None)."""
     if want:
         value = carrier_entry.get(want)
         return (value, want) if value else (None, None)
-    for variant in cfg["apn_variant_order"]:
+    order = cfg["apn_variant_order_5g"] if prefer_5g else cfg["apn_variant_order"]
+    for variant in order:
         value = carrier_entry.get(variant)
         if value:
             return value, variant
     return None, None
 
 
-def _entry_apn(entry, cfg: dict = None):
+def _entry_apn(entry, cfg: dict = None, prefer_5g=False):
     """Normalizes one map value into {'apn': ..., ...}.
 
     Three accepted forms:
@@ -956,10 +1033,12 @@ def _entry_apn(entry, cfg: dict = None):
             log.warning(f"Config references unknown carrier '{carrier_name}'; "
                         f"known carriers: {', '.join(sorted(cfg['carriers'] or {}))}")
             return None
-        apn, variant = _carrier_variant(carrier, cfg, entry.get("variant"))
+        apn, variant = _carrier_variant(carrier, cfg, entry.get("variant"), prefer_5g)
         if not apn:
+            order = (cfg["apn_variant_order_5g"] if prefer_5g
+                     else cfg["apn_variant_order"])
             log.warning(f"Carrier '{carrier_name}' has no usable APN field "
-                        f"(wanted {entry.get('variant') or cfg['apn_variant_order']})")
+                        f"(wanted {entry.get('variant') or order})")
             return None
         out = {"apn": apn,
                "label": entry.get("label") or f"{carrier_name} ({variant})"}
@@ -1019,6 +1098,7 @@ def resolve_expected_apn(cfg: dict, m):
 
     Returns (entry_dict, matched_by) or (None, None)."""
     steps = cfg["match_order"] or ["iccid", "imsi_plmn", "carrier", "default"]
+    prefer_5g = modem_prefers_5g(cfg, m)
 
     for step in steps:
         if step == "iccid" and m.iccid:
@@ -1027,7 +1107,7 @@ def resolve_expected_apn(cfg: dict, m):
             # written for a whole batch.
             for prefix in sorted(prefixes, key=len, reverse=True):
                 if m.iccid.startswith(str(prefix)):
-                    entry = _entry_apn(prefixes[prefix], cfg)
+                    entry = _entry_apn(prefixes[prefix], cfg, prefer_5g)
                     if entry:
                         return entry, f"ICCID prefix {prefix}"
 
@@ -1035,7 +1115,7 @@ def resolve_expected_apn(cfg: dict, m):
             plmns = cfg["apn_by_imsi_plmn"] or {}
             for plmn, how in _plmn_candidates(m):
                 if plmn in plmns:
-                    entry = _entry_apn(plmns[plmn], cfg)
+                    entry = _entry_apn(plmns[plmn], cfg, prefer_5g)
                     if entry:
                         return entry, f"home PLMN {plmn} via {how}"
 
@@ -1047,7 +1127,7 @@ def resolve_expected_apn(cfg: dict, m):
                         continue
                     if plmn not in (carrier.get("mcc_mnc_prefixes") or []):
                         continue
-                    apn, variant = _carrier_variant(carrier, cfg)
+                    apn, variant = _carrier_variant(carrier, cfg, prefer_5g=prefer_5g)
                     if not apn:
                         log.warning(f"Carrier table entry '{name}' matched PLMN {plmn} "
                                     f"but has no field from {cfg['apn_variant_order']}")
@@ -1058,7 +1138,7 @@ def resolve_expected_apn(cfg: dict, m):
                             f"carrier table, home PLMN {plmn} via {how}")
 
         elif step == "default" and cfg["default_apn"]:
-            entry = _entry_apn(cfg["default_apn"], cfg)
+            entry = _entry_apn(cfg["default_apn"], cfg, prefer_5g)
             if entry:
                 return entry, "default_apn"
 
@@ -1388,6 +1468,9 @@ def process_modem(m: Modem, cfg: dict, apply_fix: bool, force: bool) -> dict:
     log.info(f"{prefix}manufacturer={m.manufacturer}, model={m.model}, "
              f"revision={m.revision}, MM state={m.mm_state}, "
              f"registration={m.mm_reg_state}")
+    log.info(f"{prefix}capabilities: current=[{', '.join(m.current_capabilities) or '?'}], "
+             f"access-tech=[{', '.join(m.access_technologies) or '?'}] -> "
+             f"{'5G' if m.has_5g else 'LTE'} APN variants")
 
     if not m.is_sierra and not cfg["allow_non_sierra"]:
         log.info(f"{prefix}Not a Sierra Wireless modem - skipping "
@@ -1536,6 +1619,10 @@ def print_modem_listing(modems):
               f"(rev {m.revision or '?'})")
         print(f"    sierra:     {m.is_sierra} (usb vendor {m.vendor_id or '?'})")
         print(f"    imei:       {m.imei or '?'}")
+        print(f"    caps:       current=[{', '.join(m.current_capabilities) or '?'}] "
+              f"supported=[{', '.join(m.supported_capabilities) or '?'}]")
+        print(f"    5g:         {m.has_5g} (uses "
+              f"{'apn_variant_order_5g' if m.has_5g else 'apn_variant_order'})")
         print(f"    at ports:   {', '.join(m.at_ports) or 'NONE FOUND'}")
         print(f"    qmi port:   {m.qmi_port or '-'}")
         print(f"    iccid:      {m.iccid or '?'}")
