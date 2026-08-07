@@ -134,5 +134,25 @@
   "verify_poll_seconds": 5.0,
 
   "usb_vendor_ids": ["1199", "413c", "03f0"],
-  "allow_non_sierra": false
+  "allow_non_sierra": false,
+
+  "_readme_networkmanager": [
+    "AT+CGDCONT profile 1 above only affects LTE INITIAL ATTACH. belaUI never reads",
+    "it - belaUI's own data connection runs through a SEPARATE NetworkManager 'gsm'",
+    "connection profile it creates and manages itself, with its OWN apn field, keyed",
+    "by gsm.device-id + gsm.sim-id (NOT the IMEI/ICCID directly). belaUI defaults new",
+    "connections to auto-detecting the APN (which blanks it and defers to",
+    "NetworkManager's own carrier database) or a literal 'internet' APN if this",
+    "NetworkManager build doesn't support that - either way, almost always wrong for",
+    "an MVNO. Both this AND the CGDCONT profile have to be correct for belaUI to",
+    "actually establish a data connection - see the README section on this."
+  ],
+
+  "configure_networkmanager": true,
+  "nm_disable_autoconfig": true,
+  "nm_apply_timeout_seconds": 20.0,
+  "nm_verify_timeout_seconds": 30.0,
+  "nm_verify_poll_seconds": 2.0,
+  "nm_wait_for_connection_seconds": 20.0,
+  "nm_wait_for_connection_poll_seconds": 2.0
 }

@@ -211,6 +211,51 @@ DEFAULT_CONFIG = {
     # AT!ENTERCND / AT!GSTATUS? are Sierra-specific and will just ERROR out
     # on anything else.
     "allow_non_sierra": False,
+
+    # --- NetworkManager (belaUI's actual data-connection layer) ---
+    #
+    # AT+CGDCONT profile 1 (everything above) only affects LTE INITIAL
+    # ATTACH. belaUI never reads it. belaUI's own data connection - the thing
+    # that actually gets bonded - runs entirely through a SEPARATE
+    # NetworkManager "gsm" connection profile that it creates and manages
+    # itself, keyed by gsm.device-id + gsm.sim-id, with its OWN gsm.apn
+    # field. belaUI auto-creates that profile within ~1s of first seeing a
+    # modem+SIM, defaulting to autoconfig on (which blanks the APN and defers
+    # to NetworkManager's own carrier database) or a literal "internet" APN
+    # if this NetworkManager doesn't support auto-config at all. Either way,
+    # for a non-default-APN SIM (any MVNO, most non-US carriers), that's
+    # almost always wrong - independently of whether the CGDCONT fix above
+    # ran or succeeded. See the README section on this for the full
+    # explanation; this is not a redundant safety net, it's a second,
+    # separate bug that has to be fixed for belaUI to actually connect.
+    #
+    # Master switch. On by default: without this, the CGDCONT fix alone
+    # cannot make belaUI actually establish a data connection for any SIM
+    # that doesn't use the literal APN "internet".
+    "configure_networkmanager": True,
+    # Turn off belaUI's/NetworkManager's own APN auto-detection on the
+    # matched connection, so our explicit value isn't blanked out again the
+    # next time belaUI touches it. Silently skipped on a NetworkManager that
+    # doesn't support the gsm.auto-config property at all.
+    "nm_disable_autoconfig": True,
+    "nm_apply_timeout_seconds": 20.0,
+    # How long to wait for NetworkManager to report the connection actually
+    # activated after the APN is corrected. belaUI's own 1s polling loop is
+    # what actually issues `nmcli connection up`, not this script - this is
+    # purely verifying the outcome, the same way GSTATUS verifies the
+    # CGDCONT fix rather than just trusting the write succeeded.
+    "nm_verify_timeout_seconds": 30.0,
+    "nm_verify_poll_seconds": 2.0,
+    # How long to wait for belaUI to auto-create its NM connection before
+    # giving up on this modem's NetworkManager fix. Exists for one specific
+    # race: if this daemon starts before belaUI does (both can start at
+    # boot, in either order), a modem already plugged in gets checked once
+    # at startup with nothing to find yet - and without a retry here, that
+    # was a one-shot check with no later hotplug event to trigger a second
+    # look, silently leaving the NM APN wrong until the modem is unplugged
+    # and replugged. This bounds that wait instead of assuming ordering.
+    "nm_wait_for_connection_seconds": 20.0,
+    "nm_wait_for_connection_poll_seconds": 2.0,
 }
 
 _SIERRA_HINT_RE = re.compile(r"sierra|em7[45]\d\d|em9\d\d\d|mc7\d\d\d", re.I)
@@ -681,6 +726,10 @@ class Modem:
         self.current_capabilities = []
         self.supported_capabilities = []
         self.access_technologies = []
+        # ModemManager's device-identifier - what belaUI matches its own
+        # NetworkManager gsm connections against (gsm.device-id). See the
+        # comment on this field in _describe_modem().
+        self.nm_device_id = None
 
     @property
     def label(self) -> str:
@@ -808,6 +857,16 @@ def _describe_modem(index: int, cfg: dict):
     m.mm_reg_state = _dig(data, "modem", "3gpp", "registration-state")
     m.registered_operator_code = _dig(data, "modem", "3gpp", "operator-code")
     m.operator_name = _dig(data, "modem", "3gpp", "operator-name")
+    # This is what belaUI itself keys its NetworkManager gsm connections on
+    # (gsm.device-id), NOT the IMEI - see registerModem()/modemGetConfig() in
+    # belaUI.js. It's a ModemManager-computed hash distinct from any hardware
+    # serial number. Field naming here follows the same hyphenated-property
+    # convention every other mmcli field above already uses successfully
+    # (operator-code, equipment-identifier, current-capabilities); unverified
+    # against a live mmcli JSON dump at the time this was written, so
+    # find_nm_connection() treats an empty value as "can't match" rather than
+    # guessing.
+    m.nm_device_id = _dig(data, "modem", "generic", "device-identifier")
 
     ports = _dig(data, "modem", "generic", "ports") or []
     m.at_ports, m.qmi_port = _parse_ports(ports)
@@ -1364,6 +1423,256 @@ def wait_for_registration(transport, cfg: dict, prefix="") -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# NetworkManager: belaUI's actual data-connection layer
+#
+# See the "configure_networkmanager" comment in DEFAULT_CONFIG for why this
+# exists. Short version: the AT+CGDCONT fix above makes the modem attach to
+# the network; it has no effect on whether belaUI can actually establish a
+# data connection over it, because belaUI gets its APN from a NetworkManager
+# "gsm" connection profile it manages itself, not from the modem's NVRAM.
+# ---------------------------------------------------------------------------
+
+class NMError(Exception):
+    """nmcli failed in a way that isn't just 'no matching connection'."""
+
+
+def _nmcli_get(args, timeout=20.0):
+    """Runs `nmcli -t -g <fields> ...` and returns the output split into one
+    string per requested field, in order - or None if nmcli itself failed
+    (as opposed to succeeding with empty values, which is a real answer:
+    an unset gsm.apn is exactly the mismatch this looks for)."""
+    rc, out, err = run(["nmcli", "-t"] + args, timeout=timeout)
+    if rc != 0:
+        log.debug(f"nmcli {' '.join(args)} failed (rc={rc}): {err.strip() or out.strip()}")
+        return None
+    return out.split("\n")
+
+
+def find_nm_connection(device_id: str, iccid: str, timeout=20.0):
+    """Finds the NetworkManager gsm connection belaUI created for this
+    modem+SIM, matched exactly the way belaUI itself matches it in
+    getGsmConns()/modemGetConfig(): by gsm.device-id AND gsm.sim-id.
+
+    Deliberately does NOT create a connection if none is found - belaUI's own
+    updateModems() loop (1s interval) creates one automatically as soon as it
+    sees the modem via ModemManager, with several fields (ipv6.method,
+    autoconnect-retries, sim-operator-id, ...) this script doesn't know
+    belaUI's exact current defaults for. Racing that auto-creation, or
+    diverging from it, risks a duplicate/conflicting profile that's worse
+    than doing nothing. If nothing is found, the caller logs it as a
+    distinct, visible state rather than silently skipping.
+
+    Returns the connection UUID, or None."""
+    if not device_id or not iccid:
+        return None
+
+    rc, out, err = run(["nmcli", "-t", "-f", "UUID,TYPE", "connection", "show"], timeout=timeout)
+    if rc != 0:
+        log.warning(f"Could not list NetworkManager connections: {err.strip()[:200]}")
+        return None
+
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) < 2 or parts[1] != "gsm":
+            continue
+        uuid = parts[0]
+        fields = _nmcli_get(["-g", "gsm.device-id,gsm.sim-id",
+                             "connection", "show", uuid], timeout=timeout)
+        if not fields or len(fields) < 2:
+            continue
+        if fields[0] == device_id and fields[1] == iccid:
+            return uuid
+    return None
+
+
+def read_nm_apn(uuid: str, timeout=20.0):
+    """Returns (apn, autoconfig) for a gsm connection. autoconfig is None on
+    a NetworkManager build with no gsm.auto-config property at all (older
+    releases) - not the same as it being explicitly off."""
+    fields = _nmcli_get(["-g", "gsm.apn,gsm.auto-config",
+                         "connection", "show", uuid], timeout=timeout)
+    if not fields:
+        return None, None
+    apn = fields[0] or None
+    autoconfig = None
+    if len(fields) > 1 and fields[1] != "":
+        autoconfig = fields[1].lower() == "yes"
+    return apn, autoconfig
+
+
+def patch_nm_connection(uuid: str, apn: str, disable_autoconfig: bool, timeout=20.0) -> bool:
+    """Sets gsm.apn (and gsm.auto-config, if asked and supported) on an
+    existing connection, then bounces it - mirroring exactly what belaUI's
+    own handleModemConfig() does on a manual settings change
+    (nmConnSetFields + nmDisconnect), so this looks to belaUI like the user
+    edited the modem's settings in its own UI, not like an outside process
+    fighting it."""
+    args = ["connection", "modify", uuid, "gsm.apn", apn]
+    if disable_autoconfig:
+        args += ["gsm.auto-config", "no"]
+
+    rc, out, err = run(["nmcli"] + args, timeout=timeout)
+    if rc != 0 and disable_autoconfig:
+        # This NetworkManager may not have the gsm.auto-config property at
+        # all (pre-1.24-ish). Retry with just the APN rather than failing
+        # the whole fix over an optional field.
+        log.debug(f"nmcli modify with gsm.auto-config failed, retrying without it: "
+                  f"{err.strip()[:200]}")
+        rc, out, err = run(["nmcli", "connection", "modify", uuid, "gsm.apn", apn],
+                           timeout=timeout)
+
+    if rc != 0:
+        log.error(f"nmcli connection modify failed for {uuid}: {err.strip()[:200]}")
+        return False
+
+    # Bring it down so belaUI's own polling loop redials fresh with the
+    # corrected APN on its next ~1s tick, rather than leaving a bearer that
+    # may already be up (however badly) with the old one. A harmless no-op
+    # if it wasn't up to begin with.
+    run(["nmcli", "connection", "down", uuid], timeout=timeout)
+    return True
+
+
+def nm_connection_state(uuid: str, timeout=20.0):
+    fields = _nmcli_get(["-g", "GENERAL.STATE", "connection", "show", uuid], timeout=timeout)
+    return fields[0] if fields else None
+
+
+def wait_for_nm_activation(uuid: str, cfg: dict, prefix="") -> bool:
+    """Polls the connection's state until NetworkManager reports it
+    activated, or the budget runs out. This doesn't dial the connection
+    itself - belaUI's own updateModems() loop does that, once it sees the
+    modem in a 'registered'/'enabled' state - it only verifies that the
+    APN fix actually resulted in a working bearer, rather than stopping at
+    'we wrote the setting' and hoping."""
+    timeout = cfg["nm_verify_timeout_seconds"]
+    interval = cfg["nm_verify_poll_seconds"]
+    log.info(f"{prefix}Waiting up to {timeout:.0f}s for belaUI/NetworkManager to bring "
+             f"the data connection up...")
+
+    deadline = time.monotonic() + timeout
+    last_state = None
+    while time.monotonic() < deadline:
+        state = nm_connection_state(uuid)
+        if state != last_state:
+            log.info(f"{prefix}  NetworkManager connection state: {state or 'unknown'}")
+            last_state = state
+        # Exact match, not a substring test: nmcli's own "deactivated" state
+        # literally contains the substring "activated", so `in` here would
+        # report a torn-down connection as a successful activation - caught
+        # by testing this against a state machine that actually goes through
+        # deactivated on its way back up (patch_nm_connection brings the
+        # connection down before belaUI redials it).
+        if state and state.strip().lower() == "activated":
+            return True
+        time.sleep(interval)
+    return False
+
+
+def ensure_networkmanager_apn(m: Modem, cfg: dict, expected_apn: str,
+                                apply_fix: bool, force: bool, prefix="") -> dict:
+    """Checks (and, if apply_fix, fixes) belaUI's own NetworkManager gsm
+    connection for this modem+SIM. Idempotent, same philosophy as the
+    CGDCONT fix: only writes and bounces the connection if the APN it finds
+    is actually wrong (or `force`), so a rig that's already correctly
+    connected doesn't get its link cycled on every hotplug/boot pass.
+
+    Mirrors the AT-layer contract: apply_fix=False reports a mismatch as
+    "needs-fix" without changing anything, matching --check's behaviour for
+    the CGDCONT profile.
+
+    Never raises - every path returns a result dict, so one modem's
+    NetworkManager quirks can't take down the whole run."""
+    # "not-found" distinguishes "we tried and couldn't locate the connection"
+    # from the default "skipped" a caller sees when this function was never
+    # invoked at all (configure_networkmanager off, or no expected_apn) - the
+    # summary/exit-code logic in main() needs to tell those apart.
+    result = {"action": "not-found", "uuid": None, "found_apn": None, "activated": None,
+             "detail": ""}
+
+    if not m.nm_device_id:
+        log.warning(f"{prefix}No ModemManager device-identifier for this modem; can't "
+                    f"locate its NetworkManager connection the way belaUI does. Check "
+                    f"manually: nmcli -g gsm.device-id,gsm.sim-id,gsm.apn connection show")
+        result["detail"] = "no device-identifier"
+        return result
+
+    # belaUI creates this connection itself within ~1s of seeing the modem
+    # via ModemManager - but if THIS daemon started before belaUI did (both
+    # can start at boot; ordering isn't guaranteed), it may genuinely not
+    # exist yet at the moment this runs. Poll for it rather than checking
+    # once, since a one-shot miss here has no later trigger to catch it -
+    # the next chance would be another hotplug event, which may never come
+    # for a modem that's simply left plugged in.
+    wait_deadline = time.monotonic() + cfg["nm_wait_for_connection_seconds"]
+    uuid = find_nm_connection(m.nm_device_id, m.iccid, timeout=cfg["nm_apply_timeout_seconds"])
+    waited = False
+    while not uuid and time.monotonic() < wait_deadline:
+        waited = True
+        time.sleep(cfg["nm_wait_for_connection_poll_seconds"])
+        uuid = find_nm_connection(m.nm_device_id, m.iccid, timeout=cfg["nm_apply_timeout_seconds"])
+    if waited and uuid:
+        log.info(f"{prefix}NetworkManager connection appeared after waiting")
+
+    if not uuid:
+        log.warning(f"{prefix}No NetworkManager gsm connection found for device-id="
+                    f"{m.nm_device_id}, sim-id={m.iccid} after waiting "
+                    f"{cfg['nm_wait_for_connection_seconds']:.0f}s. belaUI normally "
+                    f"creates this within ~1s of seeing the modem - if it's still "
+                    f"missing, belaUI itself likely isn't running. Check manually: "
+                    f"nmcli -g gsm.device-id,gsm.sim-id,gsm.apn connection show")
+        result["detail"] = "no matching NM connection"
+        return result
+
+    result["uuid"] = uuid
+    current_apn, autoconfig = read_nm_apn(uuid, timeout=cfg["nm_apply_timeout_seconds"])
+    result["found_apn"] = current_apn
+    log.info(f"{prefix}belaUI's NetworkManager connection {uuid}: "
+             f"apn={current_apn!r}, auto-config={autoconfig}")
+
+    mismatch = (current_apn or "").strip().lower() != expected_apn.strip().lower()
+    stale_autoconfig = bool(cfg["nm_disable_autoconfig"] and autoconfig)
+
+    if not mismatch and not stale_autoconfig and not force:
+        log.info(f"{prefix}NetworkManager APN already correct - no action taken")
+        result["action"] = "already-correct"
+        return result
+
+    reasons = []
+    if mismatch:
+        reasons.append(f"APN {current_apn!r} != {expected_apn!r}")
+    if stale_autoconfig:
+        reasons.append("auto-config is still on (would blank the APN again)")
+    log.warning(f"{prefix}NetworkManager MISMATCH: "
+               f"{'; '.join(reasons) or 'forced'}")
+
+    if not apply_fix:
+        log.info(f"{prefix}Check-only mode - not touching NetworkManager. "
+                 f"Re-run with --fix to correct it.")
+        result["action"] = "needs-fix"
+        return result
+
+    if not patch_nm_connection(uuid, expected_apn, cfg["nm_disable_autoconfig"],
+                               timeout=cfg["nm_apply_timeout_seconds"]):
+        result["action"] = "fix-failed"
+        result["detail"] = "nmcli connection modify failed"
+        return result
+
+    result["action"] = "fixed"
+    activated = wait_for_nm_activation(uuid, cfg, prefix=prefix)
+    result["activated"] = activated
+    if activated:
+        log.info(f"{prefix}NetworkManager connection activated with the corrected APN")
+    else:
+        log.error(f"{prefix}APN corrected, but NetworkManager did not report the "
+                  f"connection activated within {cfg['nm_verify_timeout_seconds']:.0f}s. "
+                  f"If the modem isn't registered yet, belaUI won't dial it until it is - "
+                  f"check the CGDCONT/GSTATUS result above. If it IS registered, check "
+                  f"`nmcli connection up {uuid}` manually for the real error.")
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Per-modem orchestration
 # ---------------------------------------------------------------------------
 
@@ -1460,9 +1769,16 @@ def process_modem(m: Modem, cfg: dict, apply_fix: bool, force: bool) -> dict:
         "matched_by": None,
         "action": "none",
         "registered": None,
+        # NetworkManager layer - belaUI's actual data connection, separate
+        # from the CGDCONT attach fix above. See ensure_networkmanager_apn().
+        "nm_action": "skipped",
+        "nm_uuid": None,
+        "nm_found_apn": None,
+        "nm_activated": None,
         "ok": True,
         "detail": "",
     }
+    expected_apn = None
 
     log.info(f"{prefix}--- checking ---")
     log.info(f"{prefix}manufacturer={m.manufacturer}, model={m.model}, "
@@ -1488,6 +1804,9 @@ def process_modem(m: Modem, cfg: dict, apply_fix: bool, force: bool) -> dict:
         return result
 
     try:
+        need_write = False
+        expected_pdp = None
+
         # Read-only pass first: identify the SIM and read the stored profile.
         with open_transport(m, cfg, want_write=False, prefix=prefix) as transport:
             if not m.iccid or not m.imsi:
@@ -1535,59 +1854,86 @@ def process_modem(m: Modem, cfg: dict, apply_fix: bool, force: bool) -> dict:
             if not apn_mismatch and not pdp_mismatch and not force:
                 log.info(f"{prefix}Internal APN already correct - no action taken")
                 result["action"] = "already-correct"
-                return result
-
-            if force and not apn_mismatch and not pdp_mismatch:
-                log.warning(f"{prefix}Profile already correct, but --force was given; "
-                            f"rewriting and cycling the radio anyway")
-            else:
+            elif not apply_fix:
                 reasons = []
                 if apn_mismatch:
                     reasons.append(f"APN {repr(current_apn)} != {repr(expected_apn)}")
                 if pdp_mismatch:
                     reasons.append(f"PDP type {repr(current_pdp)} != {repr(expected_pdp)}")
-                log.warning(f"{prefix}MISMATCH: {'; '.join(reasons)}")
-
-            if not apply_fix:
+                log.warning(f"{prefix}MISMATCH: {'; '.join(reasons) or 'forced'}")
                 log.info(f"{prefix}Check-only mode - not applying the fix. "
                          f"Re-run with --fix to correct it.")
                 result["action"] = "needs-fix"
-                return result
+            else:
+                if force and not apn_mismatch and not pdp_mismatch:
+                    log.warning(f"{prefix}Profile already correct, but --force was given; "
+                                f"rewriting and cycling the radio anyway")
+                else:
+                    reasons = []
+                    if apn_mismatch:
+                        reasons.append(f"APN {repr(current_apn)} != {repr(expected_apn)}")
+                    if pdp_mismatch:
+                        reasons.append(f"PDP type {repr(current_pdp)} != {repr(expected_pdp)}")
+                    log.warning(f"{prefix}MISMATCH: {'; '.join(reasons)}")
+                need_write = True
 
         # Write pass. Deliberately a separate transport: on "auto" the check
         # above ran through mmcli, and the write needs direct serial under an
         # inhibit. The read transport is fully closed (and MM's debug logging
-        # restored) before this opens.
-        with open_transport(m, cfg, want_write=True, prefix=prefix) as transport:
-            applied = apply_apn_fix(transport, cfg, expected_apn, expected_pdp, prefix=prefix)
-            if not applied:
-                result["ok"] = False
-                result["action"] = "fix-failed"
-                result["detail"] = "the modem did not accept the write sequence"
-                return result
+        # restored) before this opens. Only entered when the read pass found
+        # an actual mismatch (or --force) AND --fix was given.
+        if need_write:
+            with open_transport(m, cfg, want_write=True, prefix=prefix) as transport:
+                applied = apply_apn_fix(transport, cfg, expected_apn, expected_pdp, prefix=prefix)
+                if not applied:
+                    result["ok"] = False
+                    result["action"] = "fix-failed"
+                    result["detail"] = "the modem did not accept the write sequence"
+                else:
+                    result["action"] = "fixed"
+                    registered, status = wait_for_registration(transport, cfg, prefix=prefix)
+                    result["registered"] = registered
+                    if registered:
+                        log.info(f"{prefix}SUCCESS: registered and attached "
+                                 f"(EMM={status.get('emm_state')}/{status.get('emm_substate')}, "
+                                 f"PS={status.get('ps_state')}, mode={status.get('system_mode')})")
+                    else:
+                        result["ok"] = False
+                        result["detail"] = (f"not attached within "
+                                            f"{cfg['verify_timeout_seconds']:.0f}s "
+                                            f"(EMM={status.get('emm_state')}, "
+                                            f"PS={status.get('ps_state')})")
+                        log.error(f"{prefix}FAILED to attach within "
+                                  f"{cfg['verify_timeout_seconds']:.0f}s. Last state: "
+                                  f"EMM={status.get('emm_state')} "
+                                  f"({status.get('emm_substate')}), "
+                                  f"PS={status.get('ps_state')}, "
+                                  f"system mode={status.get('system_mode')}. "
+                                  f"The corrected APN IS written and the radio IS on, so it may "
+                                  f"still attach shortly; if not, verify the APN value itself, "
+                                  f"the SIM's activation status, and antenna/signal.")
 
-            result["action"] = "fixed"
-            registered, status = wait_for_registration(transport, cfg, prefix=prefix)
-            result["registered"] = registered
-            if registered:
-                log.info(f"{prefix}SUCCESS: registered and attached "
-                         f"(EMM={status.get('emm_state')}/{status.get('emm_substate')}, "
-                         f"PS={status.get('ps_state')}, mode={status.get('system_mode')})")
-            else:
+        # NetworkManager layer. Runs whenever an expected APN was resolved,
+        # independent of what happened above: even if the CGDCONT write
+        # failed or the modem hasn't attached yet, belaUI's NM connection can
+        # still be checked (and in --fix mode, corrected) now so it's ready
+        # the moment attach does succeed - and because this is a genuinely
+        # separate bug from the CGDCONT one, not a consequence of it.
+        if expected_apn and cfg["configure_networkmanager"]:
+            nm_result = ensure_networkmanager_apn(m, cfg, expected_apn, apply_fix, force,
+                                                  prefix=prefix)
+            result["nm_action"] = nm_result["action"]
+            result["nm_uuid"] = nm_result["uuid"]
+            result["nm_found_apn"] = nm_result["found_apn"]
+            result["nm_activated"] = nm_result["activated"]
+            if nm_result["action"] == "fix-failed":
                 result["ok"] = False
-                result["detail"] = (f"not attached within "
-                                    f"{cfg['verify_timeout_seconds']:.0f}s "
-                                    f"(EMM={status.get('emm_state')}, "
-                                    f"PS={status.get('ps_state')})")
-                log.error(f"{prefix}FAILED to attach within "
-                          f"{cfg['verify_timeout_seconds']:.0f}s. Last state: "
-                          f"EMM={status.get('emm_state')} "
-                          f"({status.get('emm_substate')}), "
-                          f"PS={status.get('ps_state')}, "
-                          f"system mode={status.get('system_mode')}. "
-                          f"The corrected APN IS written and the radio IS on, so it may "
-                          f"still attach shortly; if not, verify the APN value itself, "
-                          f"the SIM's activation status, and antenna/signal.")
+                if not result["detail"]:
+                    result["detail"] = f"NetworkManager: {nm_result['detail']}"
+            elif nm_result["action"] == "fixed" and nm_result["activated"] is False:
+                result["ok"] = False
+                if not result["detail"]:
+                    result["detail"] = "NetworkManager APN corrected but connection did not activate"
 
     except ATError as e:
         log.error(f"{prefix}AT communication failed: {e}")
@@ -1613,7 +1959,7 @@ EXIT_FIX_FAILED = 20
 EXIT_ERROR = 30
 
 
-def print_modem_listing(modems):
+def print_modem_listing(modems, cfg):
     for m in modems:
         print(f"modem {m.mm_index}: {m.manufacturer or '?'} {m.model or '?'} "
               f"(rev {m.revision or '?'})")
@@ -1630,15 +1976,29 @@ def print_modem_listing(modems):
         print(f"    home plmn:  {', '.join(f'{p} ({how})' for p, how in _plmn_candidates(m)) or '?'}")
         print(f"    registered: {m.operator_name or '?'} ({m.registered_operator_code or '?'})")
         print(f"    mm state:   {m.mm_state or '?'} / reg {m.mm_reg_state or '?'}")
+        print(f"    nm dev-id:  {m.nm_device_id or '?'}")
+        if cfg["configure_networkmanager"] and m.nm_device_id and m.iccid:
+            uuid = find_nm_connection(m.nm_device_id, m.iccid,
+                                      timeout=cfg["nm_apply_timeout_seconds"])
+            if uuid:
+                apn, autoconfig = read_nm_apn(uuid, timeout=cfg["nm_apply_timeout_seconds"])
+                state = nm_connection_state(uuid, timeout=cfg["nm_apply_timeout_seconds"])
+                print(f"    nm conn:    {uuid} (apn={apn!r}, auto-config={autoconfig}, "
+                      f"state={state or 'unknown'})")
+            else:
+                print(f"    nm conn:    none found yet - belaUI hasn't registered "
+                      f"this modem+SIM in NetworkManager")
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="modem-apn-fix.py",
-        description="Check and repair the internal LTE attach APN stored in "
-                    "Sierra Wireless modem NVRAM (AT+CGDCONT profile 1).",
+        description="Check and repair the internal LTE attach APN stored in Sierra "
+                    "Wireless modem NVRAM (AT+CGDCONT profile 1), AND belaUI's own "
+                    "NetworkManager gsm connection APN - both have to be correct for "
+                    "belaUI to actually establish a data connection.",
         epilog="Exit codes: 0 ok, 10 needs fixing (--check), "
-               "20 fix applied but did not register, 30 error.",
+               "20 fix applied but did not register/activate, 30 error.",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true",
@@ -1653,6 +2013,10 @@ def main(argv=None) -> int:
                         help=f"APN map location (default: {CONFIG_PATH})")
     parser.add_argument("--force", action="store_true",
                         help="rewrite and cycle even if the stored APN already matches")
+    parser.add_argument("--no-networkmanager", action="store_true",
+                        help="skip belaUI's NetworkManager gsm connection entirely - "
+                             "same as \"configure_networkmanager\": false in config, "
+                             "for troubleshooting the CGDCONT layer in isolation")
     parser.add_argument("--json", action="store_true",
                         help="print a machine-readable result summary on stdout")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -1663,6 +2027,8 @@ def main(argv=None) -> int:
         log.setLevel(logging.DEBUG)
 
     cfg = load_config(args.config)
+    if args.no_networkmanager:
+        cfg["configure_networkmanager"] = False
     warn_if_table_stale(cfg)
     modems = discover_modems(cfg)
 
@@ -1676,7 +2042,7 @@ def main(argv=None) -> int:
         if not modems:
             print("No modems found.")
             return EXIT_ERROR
-        print_modem_listing(modems)
+        print_modem_listing(modems, cfg)
         return EXIT_OK
 
     if not modems:
@@ -1696,23 +2062,40 @@ def main(argv=None) -> int:
 
     # Summary block - this is what you want in the journal when debugging
     # after the fact, without having to reconstruct it from the step logs.
+    # Both layers are reported on every line: a modem can be fine on one and
+    # broken on the other, and that distinction is the whole point of having
+    # fixed both - see the README section on why belaUI needs both correct.
     log.info("=== summary ===")
     for r in results:
-        log.info(f"modem {r['modem']} ({r['model'] or '?'}): action={r['action']}, "
+        log.info(f"modem {r['modem']} ({r['model'] or '?'}): "
+                 f"cgdcont={r['action']} (registered={r['registered']}), "
+                 f"networkmanager={r['nm_action']} (activated={r['nm_activated']}), "
                  f"sim={r['sim_label'] or r['iccid'] or 'unknown'}, "
-                 f"expected={r['expected_apn'] or '-'}, found={r['current_apn'] or '-'}, "
-                 f"registered={r['registered']}"
+                 f"expected={r['expected_apn'] or '-'}, found={r['current_apn'] or '-'}"
+                 f"{', nm_found=' + repr(r['nm_found_apn']) if r['nm_found_apn'] is not None else ''}"
                  f"{', ' + r['detail'] if r['detail'] else ''}")
 
     if args.json:
         print(json.dumps({"modems": results}, indent=2))
 
+    # Priority: an attempted-and-failed fix outranks a not-yet-attempted
+    # mismatch, which outranks a hard error. `not r["ok"]` is checked last as
+    # a backstop so no ok=False combination can silently fall through to
+    # EXIT_OK just because it didn't match one of the specific action
+    # strings above - a caller (this script's own hotplug daemon, or a
+    # future one) must never see exit 0 when something is actually broken.
     if any(r["action"] == "fixed" and not r["ok"] for r in results):
+        return EXIT_FIX_FAILED
+    if any(r["nm_action"] == "fixed" and r["nm_activated"] is False for r in results):
         return EXIT_FIX_FAILED
     if any(r["action"] in ("error", "no-mapping", "fix-failed") for r in results):
         return EXIT_ERROR
-    if any(r["action"] == "needs-fix" for r in results):
+    if any(r["nm_action"] == "fix-failed" for r in results):
+        return EXIT_ERROR
+    if any(r["action"] == "needs-fix" or r["nm_action"] == "needs-fix" for r in results):
         return EXIT_NEEDS_FIX
+    if any(not r["ok"] for r in results):
+        return EXIT_FIX_FAILED
     return EXIT_OK
 
 

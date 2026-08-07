@@ -161,11 +161,25 @@ restarted.
 
 ## 1. Copy files to the board
 
+Either clone directly on the board (simplest - this is what the rest of
+these instructions assume):
+
 ```bash
-# "belabox" below is a placeholder - use your board's actual hostname/IP,
-# or an SSH config alias if you've set one up
-scp -r belabox-hotplug belabox:~/belabox-hotplug
+# SSH in first: ssh belabox ("belabox" is a placeholder for your board's
+# actual hostname/IP, or an SSH config alias if you've set one up)
+git clone <this repo's URL> ~/belabox-hotplug-public
 ```
+
+or copy a local checkout over with `scp` if the board has no outbound git
+access:
+
+```bash
+scp -r belabox-hotplug-public belabox:~/belabox-hotplug-public
+```
+
+Either way, everything below assumes the checkout lives at
+`~/belabox-hotplug-public` on the board - adjust the paths if yours is
+somewhere else.
 
 ## 2. Install on the board (SSH in first: `ssh belabox`)
 
@@ -175,13 +189,13 @@ sudo apt install -y python3-pip
 sudo pip3 install websockets pyudev
 
 sudo mkdir -p /opt/belabox-hotplug
-sudo cp ~/belabox-hotplug/belabox_hotplug.py /opt/belabox-hotplug/
-sudo cp ~/belabox-hotplug/bootstrap_token.py /opt/belabox-hotplug/
-sudo cp ~/belabox-hotplug/LICENSE /opt/belabox-hotplug/
+sudo cp ~/belabox-hotplug-public/belabox_hotplug.py /opt/belabox-hotplug/
+sudo cp ~/belabox-hotplug-public/bootstrap_token.py /opt/belabox-hotplug/
+sudo cp ~/belabox-hotplug-public/LICENSE /opt/belabox-hotplug/
 
 # Only if you have a Sierra Wireless modem - see the section further down.
 # Without both of these files the daemon just skips the modem logic entirely.
-sudo cp ~/belabox-hotplug/modem-apn-fix.py /opt/belabox-hotplug/
+sudo cp ~/belabox-hotplug-public/modem-apn-fix.py /opt/belabox-hotplug/
 ```
 
 (`--break-system-packages` is only needed on newer pip/Ubuntu releases with
@@ -268,7 +282,7 @@ video capture device is detected automatically.
 ## 5. Install and start the service
 
 ```bash
-sudo cp ~/belabox-hotplug/belabox-hotplug.service /etc/systemd/system/
+sudo cp ~/belabox-hotplug-public/belabox-hotplug.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable belabox-hotplug
 sudo systemctl start belabox-hotplug
@@ -371,6 +385,45 @@ then verify with `AT!GSTATUS?`, looking for `EMM state: Registered` **and**
 `Limited Service` substate and no PS bearer, which is exactly what a
 rejected attach looks like.
 
+### The second, separate bug: belaUI never reads any of the above
+
+Getting the modem to attach is necessary but **not sufficient** for belaUI
+to actually connect it. belaUI's own data connection runs through a
+completely different mechanism: a NetworkManager `gsm` connection profile
+that belaUI creates and manages itself, with its **own**, independent `apn`
+field. This isn't a guess - it's read straight out of belaUI's own source
+(`getGsmConns()` / `modemGetConfig()` / `handleModemConfig()` in
+`belaUI.js`):
+
+- The moment belaUI sees a new modem+SIM (matched by ModemManager's
+  `device-identifier` + the SIM's ICCID, **not** the IMEI), it auto-creates
+  a NetworkManager connection for it - on a hardcoded 1-second polling loop
+  that runs from belaUI startup, not gated on the UI being open.
+- That connection defaults to `autoconfig: true`. If this NetworkManager
+  build supports it, `autoconfig` **blanks the APN** and hands the guess to
+  NetworkManager's own carrier database (MBPI) instead. If it doesn't
+  support that property at all, belaUI just writes the literal string
+  `"internet"`. Either way, for an MVNO (Tello, Cricket, most non-US
+  carriers) that's very likely wrong - and it's wrong independently of
+  whatever `AT+CGDCONT` profile 1 says, because belaUI never looks at
+  profile 1.
+- belaUI only *dials* that connection once ModemManager reports the modem
+  as `registered`/`enabled`. A modem stuck on a bad attach APN never reaches
+  that state, so belaUI never even attempts to connect it - meaning the
+  CGDCONT fix above is a **precondition**, not a substitute, for this part.
+
+So there are two independent APN mismatches, in two different subsystems,
+configured through two different channels, and **both have to be correct**
+before belaUI can establish a working data connection. Fixing only the
+modem's internal profile gets it registered on the network and then stuck
+exactly where it was before - belaUI still can't connect it, for a
+completely different reason that looks, from the outside, identical to the
+first problem.
+
+`modem-apn-fix.py` fixes both, using the same resolved APN for each, and
+verifies both independently: `AT!GSTATUS?` for the attach, and polling
+NetworkManager's own connection state for the data bearer.
+
 ### What the script does
 
 1. **Finds every connected Sierra modem and each one's AT port dynamically**,
@@ -399,15 +452,28 @@ rejected attach looks like.
    correct drops a working link for no reason.
 5. **Only on mismatch**, applies the sequence above, then polls `AT!GSTATUS?`
    every 5s for up to 90s until the modem is Registered + Attached.
-6. **Logs every step** - which modem, which SIM, expected vs. found APN,
-   whether the fix ran, whether registration actually came back - plus a
-   summary block at the end, because this is not something you can debug
-   blind from a journal that only says "failed".
-7. **Fails gracefully.** Every timeout is bounded and no loop is unbounded.
-   If registration doesn't come back it says so and stops, leaving the modem
-   with its radio **on** and the corrected profile written, rather than
-   parked at `CFUN=0`. One bad modem never stops the other from being
-   handled.
+6. **Then does the same idempotent check/fix for belaUI's NetworkManager
+   connection** - the second, separate layer described above. Finds it by
+   `gsm.device-id` + `gsm.sim-id`, exactly how belaUI itself matches it, and
+   deliberately never creates one itself - only patches an existing
+   belaUI-created connection, so it can never race or duplicate belaUI's own
+   connection lifecycle. Patches `gsm.apn` and turns off `gsm.auto-config`
+   only if what it finds is actually wrong, tears the connection down so
+   belaUI redials fresh, and polls NetworkManager's own connection state for
+   `activated`. Runs regardless of what the CGDCONT step found - a modem can
+   be fine on one layer and wrong on the other.
+7. **Logs every step** - which modem, which SIM, expected vs. found APN on
+   *both* layers, whether either fix ran, whether registration and
+   activation actually came back - plus a summary block at the end, because
+   this is not something you can debug blind from a journal that only says
+   "failed".
+8. **Fails gracefully.** Every timeout is bounded and no loop is unbounded.
+   If registration or activation doesn't come back it says so and stops,
+   leaving the modem with its radio **on** and both corrected APNs written,
+   rather than parked in a half-fixed, worse-than-before state. One bad
+   modem never stops another from being handled, and a caller (this script's
+   own exit code, or the daemon reading it) can never mistake a real failure
+   for success - `ok: false` on any layer always surfaces as a non-zero exit.
 
 ### Getting the AT port away from ModemManager
 
@@ -448,12 +514,17 @@ dependency to install.
 ### Install
 
 ```bash
-sudo cp ~/belabox-hotplug/modem-apn-fix.py /opt/belabox-hotplug/
+sudo mkdir -p /etc/belabox-hotplug
+sudo cp ~/belabox-hotplug-public/modem-apn-fix.py /opt/belabox-hotplug/
 sudo chmod 755 /opt/belabox-hotplug/modem-apn-fix.py
-sudo cp ~/belabox-hotplug/modem-apn.example.json /etc/belabox-hotplug/modem-apn.json
+sudo cp ~/belabox-hotplug-public/modem-apn.example.json /etc/belabox-hotplug/modem-apn.json
 sudo chmod 600 /etc/belabox-hotplug/modem-apn.json   # ICCIDs are identifying
 sudo nano /etc/belabox-hotplug/modem-apn.json        # put your real SIMs in
 ```
+
+`nmcli`/NetworkManager is required for the NetworkManager-layer fix below -
+it's already present on any board running belaUI, since belaUI itself uses
+it extensively, so this isn't an extra install.
 
 Requires `modemmanager` (for `mmcli`); `libqmi-utils` (for `qmicli`) is
 optional and only used as an ICCID/IMSI fallback. ModemManager 1.10+ is
@@ -480,12 +551,19 @@ sudo python3 /opt/belabox-hotplug/modem-apn-fix.py --fix
 
 # One modem only, with debug logging.
 sudo python3 /opt/belabox-hotplug/modem-apn-fix.py --fix --modem 1 --verbose
+
+# Troubleshoot the CGDCONT layer in isolation, without touching NetworkManager.
+sudo python3 /opt/belabox-hotplug/modem-apn-fix.py --fix --no-networkmanager
 ```
 
-Exit codes, for scripting: `0` nothing to do or the fix verified, `10` a
-mismatch was found in `--check` mode, `20` a fix was applied but the modem
-didn't re-register in time, `30` operational error (no modems, missing
-tools, unmapped SIM). `--json` prints a machine-readable summary.
+Exit codes, for scripting: `0` nothing to do or both layers verified, `10` a
+mismatch was found (on either layer) in `--check` mode, `20` a fix was
+applied but didn't fully verify - the modem didn't re-register, or
+NetworkManager didn't activate the corrected connection (the relayed log
+lines say which), `30` operational error (no modems, missing tools, unmapped
+SIM). `--json` prints a machine-readable summary with both layers' results
+per modem (`action`/`registered` for CGDCONT, `nm_action`/`nm_activated` for
+NetworkManager).
 
 ### The APN map
 
@@ -610,6 +688,64 @@ rule because it's longer. `apn_by_imsi_plmn` lets you override a carrier
 table row without editing the table. `default_apn: null` means "log it and
 leave the modem alone" rather than guessing.
 
+### belaUI's NetworkManager connection (the second layer)
+
+Controlled by a separate set of config keys, all inert-safe defaults:
+
+```json
+{
+  "configure_networkmanager": true,
+  "nm_disable_autoconfig": true,
+  "nm_apply_timeout_seconds": 20.0,
+  "nm_verify_timeout_seconds": 30.0,
+  "nm_verify_poll_seconds": 2.0,
+  "nm_wait_for_connection_seconds": 20.0,
+  "nm_wait_for_connection_poll_seconds": 2.0
+}
+```
+
+- `configure_networkmanager`: master switch. Turn off to only ever touch the
+  modem's own NVRAM, never NetworkManager - useful if something else is
+  managing that connection and you don't want this script anywhere near it.
+- `nm_disable_autoconfig`: turns off `gsm.auto-config` on the matched
+  connection when it's on, so belaUI's own default doesn't blank the APN
+  back out again the next time it touches the connection. Silently skipped
+  on a NetworkManager build that doesn't have that property at all.
+- `nm_wait_for_connection_seconds`: how long to wait for belaUI to
+  auto-create its connection before giving up on this modem's NetworkManager
+  fix. Exists for one specific race: this daemon and belaUI can both start
+  at boot in either order, and if this daemon's one-shot startup check runs
+  before belaUI has created the connection, there's no later trigger to
+  catch it except another hotplug event - which may never come for a modem
+  that's simply left plugged in. This bounds that wait instead of assuming
+  an ordering.
+- `nm_verify_timeout_seconds`: how long to wait for NetworkManager to report
+  the connection `activated` after the APN is corrected. This script never
+  calls `nmcli connection up` itself - belaUI's own 1-second polling loop is
+  what actually dials it, once ModemManager reports the modem `registered`.
+  This setting only verifies that outcome; it can't force it.
+
+**How it finds the right connection**: by `gsm.device-id` (ModemManager's
+`device-identifier` - a computed hash, **not** the IMEI) plus `gsm.sim-id`
+(the SIM's ICCID) - the exact pair belaUI itself matches on. It **never**
+creates a connection of its own; if none exists yet (after the wait above),
+it logs that clearly and moves on, rather than risking a duplicate that
+fights belaUI's own connection lifecycle.
+
+**What a fix actually does**, mirroring `nmcli`'s own semantics for exactly
+what a manual edit in belaUI's own modem settings panel does: sets
+`gsm.apn` (and `gsm.auto-config no`, if enabled), then `nmcli connection
+down` so belaUI's next ~1-second poll tick redials fresh with the corrected
+APN rather than leaving a bearer that may already be up, however badly, with
+the old one.
+
+`--list` shows the matched connection (or its absence) for every modem:
+
+```
+    nm dev-id:  aabbccdd...
+    nm conn:    3f9a2b7e-... (apn='wholesale', auto-config=False, state=activated)
+```
+
 ### Hotplug integration
 
 `belabox_hotplug.py` runs a second udev watcher on the `usb` subsystem,
@@ -654,6 +790,29 @@ cycle radios simultaneously.
   sticking. Check `--check` right after a `--fix` - if the APN reads back
   wrong, `AT!ENTERCND` likely didn't unlock this firmware and needs a
   different password in `entercnd_password`.
+- **The modem registers fine (GSTATUS shows Attached) but belaUI still
+  shows it as disconnected/failed**: this is the second layer, not the
+  first - check `--list`'s `nm conn:` line, or run
+  `nmcli -g gsm.device-id,gsm.sim-id,gsm.apn,gsm.auto-config connection
+  show` directly. If the APN there doesn't match what you expect, that's
+  belaUI's NetworkManager connection, not the modem's internal profile -
+  re-run `--fix` (not `--fix --no-networkmanager`) to correct it.
+- **`nm dev-id: ?`**: ModemManager's `device-identifier` field came back
+  empty. The NetworkManager fix can't run without it - check
+  `mmcli -m <N> -K | grep device-identifier` directly; if it's genuinely not
+  reported by this ModemManager version, `configure_networkmanager: false`
+  disables that layer and you'll need to set the APN through belaUI's own
+  modem settings UI manually instead.
+- **"No NetworkManager gsm connection found... after waiting Ns"**: belaUI
+  itself likely isn't running, or hasn't gotten to this modem yet. Confirm
+  with `systemctl status belaUI` (or whatever belaUI's actual unit is
+  called) and that it's actually up.
+- **NetworkManager APN corrected but never shows `activated`**: this is
+  usually just sequencing, not a real failure - belaUI only dials once
+  ModemManager reports the modem `registered`, so if the CGDCONT/GSTATUS
+  result above didn't succeed either, that's the thing to fix first. If the
+  modem *is* registered and it still won't activate, try
+  `nmcli connection up <uuid>` manually and read its actual error.
 
 ## fan-lock
 

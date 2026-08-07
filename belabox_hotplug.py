@@ -962,11 +962,17 @@ async def run_modem_apn_fix(reason: str, apn_config_path: str, timeout: float):
         if line.strip():
             log.info(f"[modem-apn-fix] {line}")
 
-    # Exit codes are defined at the top of modem-apn-fix.py.
+    # Exit codes are defined at the top of modem-apn-fix.py. 20 now covers
+    # two independent things it fixes - the modem's own LTE attach (CGDCONT)
+    # and belaUI's separate NetworkManager gsm connection APN - either of
+    # which can be the one that didn't come up; the relayed [modem-apn-fix]
+    # lines above say which.
     if proc.returncode == 0:
         log.info("Modem APN check finished: nothing to do, or the fix verified OK")
     elif proc.returncode == 20:
-        log.error("Modem APN fix was applied but the modem did not re-register in time")
+        log.error("Modem APN fix was applied but did not fully verify - either the modem "
+                  "did not re-register, or belaUI's NetworkManager connection did not "
+                  "activate with the corrected APN. See the relayed lines above for which.")
     elif proc.returncode == 30:
         log.error("Modem APN check could not run (no modems, missing tools, or "
                   "an unmapped SIM) - see the relayed output above")
