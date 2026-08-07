@@ -185,7 +185,7 @@ somewhere else.
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pip
+sudo apt install -y python3-pip v4l-utils
 sudo pip3 install websockets pyudev
 
 sudo mkdir -p /opt/belabox-hotplug
@@ -200,6 +200,12 @@ sudo cp ~/belabox-hotplug-public/modem-apn-fix.py /opt/belabox-hotplug/
 
 (`--break-system-packages` is only needed on newer pip/Ubuntu releases with
 PEP 668 externally-managed environments - not required on Ubuntu 22.04.)
+
+`v4l-utils` provides `v4l2-ctl`, which the daemon's USB/HDMI detection shells
+out to constantly - without it, every HDMI poll tick fails with
+`Failed to read power_present ... 'v4l2-ctl'` and the daemon can never see
+either video source. It's normally already present on a stock BELABOX
+image; only missing on a bare/custom install.
 
 ## 3. Get an auth token (one-time, run manually)
 
