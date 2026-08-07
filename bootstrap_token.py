@@ -57,6 +57,17 @@ async def _try_port(port: int, password: str):
                 msg = json.loads(raw)
                 if "auth" in msg:
                     return msg["auth"]
+                if "notification" in msg:
+                    # A WRONG PASSWORD is reported this way, not as an
+                    # {"auth": {"success": false}} message - see tryAuth()
+                    # in belaUI.js, which calls notificationSend(conn, "auth",
+                    # "error", "Invalid password") instead. Without this
+                    # check the script waits for an "auth" key that never
+                    # arrives and only ever times out with an empty message,
+                    # which looks identical to belaUI being unreachable.
+                    for n in msg["notification"].get("show", []):
+                        if n.get("name") == "auth":
+                            raise RuntimeError(n.get("msg") or "Invalid password")
 
         auth = await asyncio.wait_for(wait_for_auth(), timeout=AUTH_TIMEOUT)
         if auth.get("success") is True and auth.get("auth_token"):
